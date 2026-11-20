@@ -1,0 +1,6 @@
+ID,Nome,Tipo,Predecessoras,FolgaTotal,BaselineHH,HHRealizado,HHRestante,HistoricoDesvios
+42,Soldagem Lote B,Interna,40FS,-8,320,180,220,4;6;8
+45,Montagem Estrutura,Interna,42FS;41SS+3d,-8,260,90,240,3;5;8
+48,Compra de Válvulas,Externa,,-2,40,20,20,1;2
+51,Jateamento/Pintura,Interna,42FS,-5,180,60,150,2;3;5
+55,Inspeção Cliente,Externa,45FS;51FS,0,30,0,30,0;0

@@ -1,0 +1,18 @@
+%T	HDR
+%F	export_type	export_date
+%R	BASELINE	2026-11-19
+%T	TASK
+%F	task_id	task_code	task_name	status_code	phys_complete_pct	target_drtn_hr_cnt	remain_drtn_hr_cnt	total_float_hr_cnt
+%R	100	42	Soldagem Lote B	TK_Active	56	320	220	-64
+%R	101	45	Montagem Estrutura	TK_Active	35	260	240	-64
+%R	102	48	Compra de Valvulas	TK_NotStart	0	40	20	-16
+%R	103	51	Jateamento Pintura	TK_Active	33	180	150	-40
+%R	104	55	Inspecao Cliente	TK_NotStart	0	30	30	0
+%T	TASKPRED
+%F	task_pred_id	task_id	pred_task_id	pred_type	pred_lag_hr_cnt
+%R	200	101	100	PR_FS	0
+%R	201	101	99	PR_SS	24
+%R	202	103	100	PR_FS	0
+%R	203	104	101	PR_FS	0
+%R	204	104	103	PR_FS	0
+%E

@@ -1,186 +1,249 @@
 """Monte Carlo + CPM + PID — camada probabilística sobre o motor prescritivo.
 
-Como se combinam (sensor × atuador):
-  • Monte Carlo = SENSOR: amostra durações (PERT o/m/p) por atividade, roda a
-    rede N vezes e devolve:
-      - P50/P80/P90 da data de término (probabilidade de prazo)
-      - ÍNDICE DE CRITICIDADE = fração das simulações em que a atividade está
-        no caminho crítico (quem é gargalo DE VERDADE, não só na planilha)
-    Esse índice reordena o "ONDE agir" do PID: crashing só em atividade com
-    criticidade alta (ex.: > 40%).
-  • PID = ATUADOR: o alvo de recuperação deixa de ser "8 dias" e passa a ser
-    a DISTÂNCIA até o percentil alvo (ex.: P80) — uk fecha a lacuna
-    probabilística, não só o desvio pontual.
+Wrapper CLI retrocompatível delegando ao pacote modular `resgate_cronograma`.
 
-Entrada: CSV com colunas extras DurO,DurM,DurP (PERT, em dias) além do
-         CSV base do cpm_pid (ID, Nome, Tipo, Predecessoras, FolgaTotal,
-         BaselineHH, HHRealizado, HHRestante, HistoricoDesvios).
-Uso:    python3 monte_carlo.py cronograma.csv [--sims 10000] [--prazo 45]
-        [--alvo 80]  (percentil alvo do compromisso)
+Uso:
+  python monte_carlo.py cronograma.csv --prazo 45 [--sims 10000] [--alvo 80]
+                        [--seed 42] [--correlacao 0.5]
+                        [--fatores-risco '{"Clima": 0.7}']
+                        [--eficiencia-crashing 1.0] [--max-iter 5] [--sem-resgate]
+                        [--custos JSON] [--json out.json] [--html out.html]
+  python monte_carlo.py --db obra.db --projeto Obra-A --prazo 45 [--ciclo N]
 """
 from __future__ import annotations
 
 import argparse
-import csv
+import json
 import random
-import re
+import sys
 from dataclasses import dataclass
+from typing import Mapping
 
-import math
+from resgate_cronograma.cost import avaliar_plano_custo_mc, carregar_parametros_custo
+from resgate_cronograma.cycle_store import resolver_atividades_cli
+from resgate_cronograma.exporters import (
+    construir_payload_monte_carlo,
+    exportar_html,
+    exportar_json,
+)
+from resgate_cronograma.models import (
+    AtividadeCronograma,
+    Dependencia,
+    ScheduleCycleError,
+    parse_dependencias,
+)
+from resgate_cronograma.monte_carlo import (
+    amostrar_pert,
+    simular_cronograma,
+)
+from resgate_cronograma.parsers import carregar_csv
+from resgate_cronograma.reporting import (
+    configurar_stdout_utf8,
+    formatar_relatorio_monte_carlo,
+)
 
-from cpm_pid import prescrever, pid_por_frente, Frente
 
-
-# ──────────────────────────────────────────────────────────────────────────
 @dataclass
 class Atividade:
+    """Adaptador retrocompatível de atividade estocástica PERT."""
+
     id: str
     nome: str
     tipo: str
-    preds: list            # [(id_pred, tipo: 'FS'|'SS', lag_dias)]
+    preds: list
     dur_o: float
     dur_m: float
     dur_p: float
 
     def amostrar(self, rng: random.Random) -> float:
-        """PERT (beta) — moda puxada pelo mais provável."""
-        if self.dur_p <= self.dur_o:
-            return self.dur_m
-        a, m, b = self.dur_o, self.dur_m, self.dur_p
-        mu = (a + 4 * m + b) / 6
-        alpha = max(((mu - a) * (2 * m - a - b)) / max((m - mu) * (b - a), 1e-9), 0.5)
-        beta = max(alpha * (b - mu) / max(mu - a, 1e-9), 0.5)
-        return a + (b - a) * rng.betavariate(alpha, beta)
+        """Amostra duração usando Modified PERT sem singularidades."""
+        return amostrar_pert(self.dur_o, self.dur_m, self.dur_p, rng)
 
 
-def parse_preds(s: str) -> list:
-    out = []
-    for tok in (s or "").split(";"):
-        tok = tok.strip()
-        if not tok:
-            continue
-        m = re.match(r"(\d+)\s*(FS|SS)?\s*([+-]\s*\d+(?:\.\d+)?)?d?", tok, re.I)
-        if m:
-            out.append((m.group(1), (m.group(2) or "FS").upper(),
-                        float((m.group(3) or "0").replace(" ", ""))))
-    return out
+def parse_preds(s: str) -> list[tuple[str, str, float]]:
+    """Converte string de predecessoras em lista `(pred_id, tipo, lag_dias)`."""
+    return [(d.pred_id, d.tipo, d.lag_dias) for d in parse_dependencias(s)]
 
 
-def simular(ats: dict[str, Atividade], prazo: float, n_sims: int, alvo: float,
-            seed: int = 42):
-    rng = random.Random(seed)
-    atrasos, critica_qtd = [], {k: 0 for k in ats}
-    succs = {k: [] for k in ats}
-    for k, a in ats.items():
-        for p, tipo, lag in a.preds:
-            if p in ats:
-                succs[p].append((k, tipo, lag))
-    for _ in range(n_sims):
-        dur = {k: a.amostrar(rng) for k, a in ats.items()}
-        ini, fim, ordem = {}, {}, []
-        restantes = dict(ats)
-        while restantes:
-            progrediu = False
-            for k, a in list(restantes.items()):
-                if all(p in fim for p, _t, _l in a.preds):
-                    ini[k] = 0.0
-                    for p, tipo, lag in a.preds:
-                        base = fim[p] if tipo == "FS" else ini[p]
-                        ini[k] = max(ini[k], base + lag)
-                    fim[k] = ini[k] + dur[k]
-                    ordem.append(k)
-                    del restantes[k]
-                    progrediu = True
-            if not progrediu:          # ciclo ou predecessor inexistente
-                for k in restantes:
-                    fim[k] = fim.get(k, 0.0) + dur[k]
-                    ordem.append(k)
-                break
-        fim_obra = max(fim.values())
-        atrasos.append(fim_obra - prazo)
-        # CRITICIDADE real = folga zero (passe pra trás), não só "termina no fim"
-        lf, ls = {}, {}
-        for k in reversed(ordem):
-            if not succs[k]:
-                lf[k] = fim_obra
-            else:
-                cand = []
-                for s, tipo, lag in succs[k]:
-                    if tipo == "FS":
-                        cand.append(ls[s] - lag)
-                    else:  # SS: atrasa o início do sucessor limita o início
-                        cand.append(ls[s] - lag + dur[k])
-                lf[k] = min(cand)
-            ls[k] = lf[k] - dur[k]
-        for k in ats:
-            if abs(ls[k] - ini[k]) < 1e-6:
-                critica_qtd[k] += 1
-    atrasos.sort()
-    def pct(p):
-        return atrasos[min(int(p / 100 * len(atrasos)), len(atrasos) - 1)]
-    indices = {k: v / n_sims for k, v in critica_qtd.items()}
-    return {"P50": pct(50), "P80": pct(80), "P90": pct(90),
-            "P(alvo)": pct(alvo), "criticidade": indices}
+def simular(
+    ats: Mapping[str, Atividade | AtividadeCronograma],
+    prazo: float,
+    n_sims: int,
+    alvo: float,
+    seed: int = 42,
+    correlacao: float = 0.0,
+) -> dict[str, object]:
+    """Executa simulação Monte Carlo compatível com a interface legada."""
+    atividades: list[AtividadeCronograma] = []
+    for item in ats.values():
+        if isinstance(item, AtividadeCronograma):
+            atividades.append(item)
+        else:
+            deps = [
+                Dependencia(pred_id=str(p), tipo=str(t).upper(), lag_dias=float(lag))  # type: ignore[arg-type]
+                for p, t, lag in item.preds
+            ]
+            atividades.append(
+                AtividadeCronograma(
+                    id=item.id,
+                    nome=item.nome,
+                    tipo=item.tipo,
+                    dependencias=deps,
+                    dur_o=item.dur_o,
+                    dur_m=item.dur_m,
+                    dur_p=item.dur_p,
+                    dur_m_explicita=item.dur_m > 0,
+                )
+            )
+
+    res = simular_cronograma(
+        atividades,
+        prazo=prazo,
+        n_sims=n_sims,
+        alvo=alvo,
+        seed=seed,
+        correlacao=correlacao,
+    )
+    return {
+        "P50": res.p50,
+        "P80": res.p80,
+        "P90": res.p90,
+        "P(alvo)": res.p_alvo,
+        "criticidade": res.criticidade,
+        "sensibilidade": res.sensibilidade,
+        "missing_predecessors": res.missing_predecessors,
+    }
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("csv")
-    ap.add_argument("--sims", type=int, default=10000)
-    ap.add_argument("--prazo", type=float, required=True, help="prazo contratual (dias)")
-    ap.add_argument("--alvo", type=float, default=80, help="percentil do compromisso")
-    args = ap.parse_args()
+def _parse_fatores_risco(raw_json: str | None) -> dict[str, float] | None:
+    if not raw_json:
+        return None
+    try:
+        bruto = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--fatores-risco JSON inválido: {exc}") from exc
+    if not isinstance(bruto, dict):
+        raise ValueError("--fatores-risco deve ser um objeto JSON {grupo: rho}.")
+    return {str(k): float(v) for k, v in bruto.items()}
 
-    ats: dict[str, Atividade] = {}
-    frentes: list[Frente] = []
-    with open(args.csv, newline="", encoding="utf-8") as fh:
-        for r in csv.DictReader(fh):
-            ats[r["ID"]] = Atividade(
-                id=r["ID"], nome=r["Nome"], tipo=r["Tipo"],
-                preds=parse_preds(r.get("Predecessoras", "")),
-                dur_o=float(r["DurO"]), dur_m=float(r["DurM"]), dur_p=float(r["DurP"]))
-            hist = [float(x) for x in r.get("HistoricoDesvios", "").split(";") if x.strip()]
-            frentes.append(Frente(
-                id=r["ID"], nome=r["Nome"], tipo=r["Tipo"],
-                predecessoras=r.get("Predecessoras", ""),
-                folga=float(r["FolgaTotal"].replace("d", "")),
-                baseline_hh=float(r["BaselineHH"]),
-                hh_realizado=float(r["HHRealizado"]),
-                hh_restante=float(r.get("HHRestante") or 0),
-                historico=hist))
 
-    res = simular(ats, args.prazo, args.sims, args.alvo)
-    print("═" * 62)
-    print(f"MONTE CARLO — {args.sims:,} simulações | prazo contratual: {args.prazo:.0f}d")
-    print("═" * 62)
-    print(f"  Término P50: {args.prazo + res['P50']:.1f}d  (50% de chance até aqui)")
-    print(f"  Término P80: {args.prazo + res['P80']:.1f}d  (compisso conservador)")
-    print(f"  Término P90: {args.prazo + res['P90']:.1f}d")
-    print(f"  Atraso esperado P{args.alvo:.0f}: {res['P(alvo)']:+.1f}d")
-    print()
-    print("ÍNDICE DE CRITICIDADE (fração das simulações no caminho crítico):")
-    for k, v in sorted(res["criticidade"].items(), key=lambda kv: -kv[1]):
-        barra = "█" * int(v * 20)
-        print(f"  ID {k:>3} ({ats[k].nome[:28]:28s}) {v:5.0%} {barra}")
-    print()
-    print("─" * 62)
-    print("PRESCRIÇÃO INTEGRADA (PID × criticidade Monte Carlo):")
-    for f in sorted(frentes, key=lambda f: -res["criticidade"].get(f.id, 0)):
-        ic = res["criticidade"].get(f.id, 0)
-        if ic < 0.40:
-            continue
-        uk, det = pid_por_frente(f)
-        uk_ajustado = uk * (0.5 + 0.5 * ic)   # pondera pelo risco de ser gargalo
-        print(f"\n▸ ID {f.id} — {f.nome} | criticidade MC: {ic:.0%}")
-        print(f"  PID: uk={det.get('uk_hh','—')} HH → ajustado pelo risco: "
-              f"{uk_ajustado:.1f} HH")
-        for a in prescrever(f, uk, det):
-            print(f"  {a}")
-    print()
-    print("─" * 62)
-    print("Lógica: só age em atividade com criticidade ≥ 40% — crashing em")
-    print("frente que é gargalo em só 5% das simulações é dinheiro queimado.")
+def main(argv: list[str] | None = None) -> int:
+    configurar_stdout_utf8()
+    parser = argparse.ArgumentParser(
+        description="Simulação Monte Carlo (Modified PERT + Iman-Conover) e malha fechada PID."
+    )
+    parser.add_argument(
+        "csv",
+        nargs="?",
+        default=None,
+        help="Caminho para o arquivo CSV de cronograma (ou use --db + --projeto)",
+    )
+    parser.add_argument("--db", default=None, help="Caminho para banco SQLite de ciclos")
+    parser.add_argument("--projeto", default=None, help="Nome do projeto no banco SQLite")
+    parser.add_argument(
+        "--ciclo",
+        type=int,
+        default=None,
+        help="Número de ciclos do HistoricoDesvios a considerar (>= 1)",
+    )
+    parser.add_argument("--sims", type=int, default=10000, help="Número de simulações")
+    parser.add_argument("--prazo", type=float, required=True, help="Prazo contratual (dias úteis)")
+    parser.add_argument("--alvo", type=float, default=80.0, help="Percentil alvo do compromisso")
+    parser.add_argument("--seed", type=int, default=42, help="Semente aleatória determinística")
+    parser.add_argument(
+        "--correlacao",
+        type=float,
+        default=0.0,
+        help="Correlação de risco global [0.0, 1.0) entre atividades do mesmo grupo",
+    )
+    parser.add_argument(
+        "--fatores-risco",
+        type=str,
+        default=None,
+        help='JSON de correlação por grupo (ex.: \'{"Clima": 0.7}\')',
+    )
+    parser.add_argument(
+        "--eficiencia-crashing",
+        type=float,
+        default=1.0,
+        help="Eficiência da conversão de HH em redução de prazo (0, 1]",
+    )
+    parser.add_argument(
+        "--max-iter",
+        type=int,
+        default=5,
+        help="Máximo de iterações da malha fechada Antes x Depois",
+    )
+    parser.add_argument(
+        "--sem-resgate",
+        action="store_true",
+        help="Desativa a re-simulação em malha fechada Antes x Depois",
+    )
+    parser.add_argument(
+        "--custos",
+        default=None,
+        help="JSON inline ou arquivo .json com parâmetros de custo em R$",
+    )
+    parser.add_argument("--json", dest="json_out", default=None, help="Caminho do relatório JSON")
+    parser.add_argument("--html", dest="html_out", default=None, help="Caminho do relatório HTML")
+    args = parser.parse_args(argv)
+
+    try:
+        fatores = _parse_fatores_risco(args.fatores_risco)
+        atividades, origem = resolver_atividades_cli(
+            args.csv, args.db, args.projeto, ciclo=args.ciclo
+        )
+        params_custo = carregar_parametros_custo(args.custos)
+        ciclo_pid = None if args.db else args.ciclo
+        resultado = simular_cronograma(
+            atividades,
+            prazo=args.prazo,
+            n_sims=args.sims,
+            alvo=args.alvo,
+            seed=args.seed,
+            ciclo=ciclo_pid,
+            correlacao=args.correlacao,
+            fatores_risco=fatores,
+            fechar_malha=not args.sem_resgate,
+            eficiencia_crashing=args.eficiencia_crashing,
+            max_iter=args.max_iter,
+        )
+        plano_custo = avaliar_plano_custo_mc(
+            atividades,
+            resultado,
+            parametros=params_custo,
+            eficiencia_crashing=args.eficiencia_crashing,
+        )
+        texto = formatar_relatorio_monte_carlo(
+            atividades, resultado, plano_custo=plano_custo
+        )
+        if args.json_out or args.html_out:
+            payload = construir_payload_monte_carlo(
+                atividades,
+                resultado,
+                parametros_custo=params_custo,
+                eficiencia_crashing=args.eficiencia_crashing,
+                origem=origem,
+            )
+            if args.json_out:
+                exportar_json(payload, args.json_out)
+            if args.html_out:
+                exportar_html(payload, args.html_out)
+    except (OSError, ValueError, TypeError, KeyError, ScheduleCycleError) as exc:
+        print(f"ERRO: {exc}", file=sys.stderr)
+        return 1
+
+    print(texto)
+    return 0
+
+
+__all__ = [
+    "Atividade",
+    "main",
+    "parse_preds",
+    "simular",
+]
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

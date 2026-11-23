@@ -7,8 +7,8 @@
     <Task><UID>45</UID><TaskID>45</TaskID><Name>Montagem Estrutura</Name>
       <Duration>PT260H</Duration><RemainingDuration>PT240H</RemainingDuration>
       <PercentComplete>35</PercentComplete><TotalSlack>PT-64H</TotalSlack>
-      <PredecessorLink><PredecessorUID>42</PredecessorUID><Type>0</Type></PredecessorLink>
-      <PredecessorLink><PredecessorUID>41</PredecessorUID><Type>1</Type><Lag>PT24H</Lag></PredecessorLink>
+      <PredecessorLink><PredecessorUID>42</PredecessorUID><Type>1</Type></PredecessorLink>
+      <PredecessorLink><PredecessorUID>41</PredecessorUID><Type>3</Type><Lag>PT24H</Lag></PredecessorLink>
     </Task>
     <Task><UID>48</UID><TaskID>48</TaskID><Name>Compra de Valvulas</Name>
       <Duration>PT40H</Duration><RemainingDuration>PT20H</RemainingDuration>
@@ -16,11 +16,11 @@
     <Task><UID>51</UID><TaskID>51</TaskID><Name>Jateamento Pintura</Name>
       <Duration>PT180H</Duration><RemainingDuration>PT150H</RemainingDuration>
       <PercentComplete>33</PercentComplete><TotalSlack>PT-40H</TotalSlack>
-      <PredecessorLink><PredecessorUID>42</PredecessorUID><Type>0</Type></PredecessorLink></Task>
+      <PredecessorLink><PredecessorUID>42</PredecessorUID><Type>1</Type></PredecessorLink></Task>
     <Task><UID>55</UID><TaskID>55</TaskID><Name>Inspecao Cliente</Name>
       <Duration>PT30H</Duration><RemainingDuration>PT30H</RemainingDuration>
       <PercentComplete>0</PercentComplete><TotalSlack>PT0H</TotalSlack>
-      <PredecessorLink><PredecessorUID>45</PredecessorUID><Type>0</Type></PredecessorLink>
-      <PredecessorLink><PredecessorUID>51</PredecessorUID><Type>0</Type></PredecessorLink></Task>
+      <PredecessorLink><PredecessorUID>45</PredecessorUID><Type>1</Type></PredecessorLink>
+      <PredecessorLink><PredecessorUID>51</PredecessorUID><Type>1</Type></PredecessorLink></Task>
   </Tasks>
 </Project>
